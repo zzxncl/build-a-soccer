@@ -1,0 +1,504 @@
+--[[
+    ██╗  ██╗ █████╗ ████████╗███████╗██╗   ██╗
+    ██║  ██║██╔══██╗╚══██╔══╝██╔════╝██║   ██║
+    ███████║███████║   ██║   ███████╗██║   ██║
+    ██╔══██║██╔══██║   ██║   ╚════██║██║   ██║
+    ██║  ██║██║  ██║   ██║   ███████║╚██████╔╝
+    ╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝   ╚══════╝ ╚═════╝
+    Hatsu Soccer Squad v2 — Event-Driven Auto Roll
+    Toggle: RCtrl
+--]]
+
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+
+local LP = Players.LocalPlayer
+local Char = LP.Character or LP.CharacterAdded:Wait()
+local HRP = Char:WaitForChild("HumanoidRootPart")
+local Humanoid = Char:WaitForChild("Humanoid")
+LP.CharacterAdded:Connect(function(c)
+    Char = c; HRP = c:WaitForChild("HumanoidRootPart"); Humanoid = c:WaitForChild("Humanoid")
+end)
+
+local Remotes = RS:WaitForChild("Remotes")
+local RollRequest = Remotes:WaitForChild("RollRequest")
+local RollResult = Remotes:WaitForChild("RollResult")
+local PickPlayer = Remotes:WaitForChild("PickPlayer")
+local RerollRequest = Remotes:WaitForChild("RerollRequest")
+local RestartRun = Remotes:WaitForChild("RestartRun")
+local RunComplete = Remotes:WaitForChild("RunComplete")
+local RareAlert = Remotes:WaitForChild("RareAlert")
+local TeamUpdate = Remotes:WaitForChild("TeamUpdate")
+local CoinsUpdate = Remotes:WaitForChild("CoinsUpdate")
+local RequestCoins = Remotes:WaitForChild("RequestCoins")
+local RequestCollection = Remotes:WaitForChild("RequestCollection")
+local RequestBestTeam = Remotes:WaitForChild("RequestBestTeam")
+
+local GameConfig = require(RS:WaitForChild("GameConfig"))
+local Tiers = GameConfig.Tiers
+
+local function getTierName(ovr)
+    for _, t in ipairs(Tiers) do
+        if ovr >= t.min then return t.name end
+    end
+    return "Bronze"
+end
+
+-- ═══ STATE ═══
+local VU = game:GetService("VirtualUser")
+
+local S = {
+    autoFarm = false,    -- master toggle: roll → pick → repeat → restart
+    antiAFK = true,      -- anti-AFK (default ON)
+    speedHack = false,
+    noclip = false,
+    visible = true,
+    lastReveals = nil,
+    lastTeam = nil,
+    rareLog = {},
+    totalRolls = 0,
+    totalPicks = 0,
+    bestPull = 0,
+    waitingForResult = false,
+    runComplete = false,
+}
+
+-- ═══ ANTI-AFK ═══
+LP.Idled:Connect(function()
+    if S.antiAFK then
+        pcall(function()
+            VU:Button2Down(Vector2.new(0,0), workspace.CurrentCamera.CFrame)
+            task.wait(0.1)
+            VU:Button2Up(Vector2.new(0,0), workspace.CurrentCamera.CFrame)
+        end)
+    end
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(60)
+        if S.antiAFK then
+            pcall(function()
+                VU:CaptureController()
+                VU:ClickButton2(Vector2.new(0,0))
+            end)
+        end
+    end
+end)
+
+-- ═══ EVENT-DRIVEN AUTO FARM ═══
+-- Flow: Roll → wait for RollResult → Pick best → wait for TeamUpdate → Roll again
+-- When RunComplete fires → Restart → Roll again
+
+local function pickBestCard(data)
+    if not data or not data.reveals then return end
+
+    local bestPos, bestOVR = nil, 0
+    for pos, card in pairs(data.reveals) do
+        -- Only pick if that position is placeable
+        if data.placeable and data.placeable[pos] then
+            if card.ovr and card.ovr > bestOVR then
+                bestOVR = card.ovr
+                bestPos = pos
+            end
+        end
+    end
+
+    -- If nothing placeable had good OVR, try any placeable position
+    if not bestPos then
+        for pos, card in pairs(data.reveals) do
+            if data.placeable and data.placeable[pos] then
+                if card.ovr and card.ovr > bestOVR then
+                    bestOVR = card.ovr
+                    bestPos = pos
+                end
+            end
+        end
+    end
+
+    if bestPos then
+        S.totalPicks = S.totalPicks + 1
+        if bestOVR > S.bestPull then S.bestPull = bestOVR end
+        PickPlayer:FireServer(bestPos)
+        return true
+    end
+    return false
+end
+
+local function doNextRoll()
+    if not S.autoFarm then return end
+    S.waitingForResult = true
+    task.wait(0.5)
+    RollRequest:FireServer()
+    S.totalRolls = S.totalRolls + 1
+end
+
+-- Listen for RollResult → auto pick
+RollResult.OnClientEvent:Connect(function(data)
+    S.lastReveals = data
+    S.waitingForResult = false
+
+    if S.autoFarm and data and data.reveals then
+        task.wait(0.3)
+        pickBestCard(data)
+    end
+end)
+
+-- Listen for TeamUpdate → trigger next roll
+TeamUpdate.OnClientEvent:Connect(function(data)
+    S.lastTeam = data
+
+    if S.autoFarm then
+        if data.complete then
+            -- Run is done, restart
+            S.runComplete = true
+            task.wait(1)
+            RestartRun:FireServer()
+            task.wait(1.5)
+            S.runComplete = false
+            doNextRoll()
+        else
+            -- Squad not full yet, roll again
+            task.wait(0.5)
+            doNextRoll()
+        end
+    end
+end)
+
+-- Listen for RunComplete as backup
+RunComplete.OnClientEvent:Connect(function()
+    if S.autoFarm then
+        S.runComplete = true
+        task.wait(1)
+        RestartRun:FireServer()
+        task.wait(1.5)
+        S.runComplete = false
+        doNextRoll()
+    end
+end)
+
+-- Listen for rare alerts
+RareAlert.OnClientEvent:Connect(function(data)
+    if data and data.name then
+        local entry = string.format("[%s] %s → %s (%d, %s%s)",
+            os.date("%H:%M:%S"), data.playerName or "?",
+            data.name, data.ovr or 0, data.tierName or "?",
+            data.shiny and " ✨" or "")
+        table.insert(S.rareLog, 1, entry)
+        if #S.rareLog > 50 then table.remove(S.rareLog) end
+    end
+end)
+
+-- ═══════════════════════════════════════════════
+--                   GUI
+-- ═══════════════════════════════════════════════
+local function buildGui()
+    local old = LP.PlayerGui:FindFirstChild("HatsuSoccer")
+    if old then old:Destroy() end
+
+    local SG = Instance.new("ScreenGui")
+    SG.Name = "HatsuSoccer"; SG.ResetOnSpawn = false
+    SG.ZIndexBehavior = Enum.ZIndexBehavior.Sibling; SG.Parent = LP.PlayerGui
+
+    local C = {
+        bg = Color3.fromRGB(18, 18, 24),
+        hdr = Color3.fromRGB(25, 25, 35),
+        brd = Color3.fromRGB(60, 50, 90),
+        acc = Color3.fromRGB(130, 80, 230),
+        accB = Color3.fromRGB(170, 120, 255),
+        txt = Color3.fromRGB(220, 215, 235),
+        dim = Color3.fromRGB(140, 135, 160),
+        on = Color3.fromRGB(100, 220, 140),
+        off = Color3.fromRGB(60, 55, 75),
+        tab = Color3.fromRGB(30, 28, 42),
+        tabA = Color3.fromRGB(45, 40, 65),
+    }
+
+    local MF = Instance.new("Frame", SG)
+    MF.Size = UDim2.new(0, 420, 0, 480)
+    MF.Position = UDim2.new(0.5, -210, 0.5, -240)
+    MF.BackgroundColor3 = C.bg; MF.BorderSizePixel = 0
+    Instance.new("UICorner", MF).CornerRadius = UDim.new(0, 6)
+    local mfS = Instance.new("UIStroke", MF)
+    mfS.Color = C.brd; mfS.Thickness = 1; mfS.Transparency = 0.3
+
+    local sh = Instance.new("ImageLabel", MF)
+    sh.BackgroundTransparency=1; sh.Image="rbxassetid://5554236805"
+    sh.ImageColor3=Color3.new(0,0,0); sh.ImageTransparency=0.6
+    sh.ScaleType=Enum.ScaleType.Slice; sh.SliceCenter=Rect.new(23,23,277,277)
+    sh.Size=UDim2.new(1,30,1,30); sh.Position=UDim2.new(0,-15,0,-15); sh.ZIndex=-1
+
+    local TB = Instance.new("Frame", MF)
+    TB.Size=UDim2.new(1,0,0,30); TB.BackgroundColor3=C.hdr; TB.BorderSizePixel=0
+    Instance.new("UICorner", TB).CornerRadius=UDim.new(0,6)
+    local tbf = Instance.new("Frame", TB)
+    tbf.Size=UDim2.new(1,0,0,8); tbf.Position=UDim2.new(0,0,1,-8)
+    tbf.BackgroundColor3=C.hdr; tbf.BorderSizePixel=0
+    local tt = Instance.new("TextLabel", TB)
+    tt.Text="⚽ HATSU Soccer v2"; tt.Font=Enum.Font.GothamBold; tt.TextSize=13
+    tt.TextColor3=C.txt; tt.BackgroundTransparency=1
+    tt.Size=UDim2.new(1,-10,1,0); tt.Position=UDim2.new(0,10,0,0)
+    tt.TextXAlignment=Enum.TextXAlignment.Left
+
+    local dg,di,ds,sp
+    TB.InputBegan:Connect(function(i)
+        if i.UserInputType==Enum.UserInputType.MouseButton1 then
+            dg=true; ds=i.Position; sp=MF.Position
+            i.Changed:Connect(function() if i.UserInputState==Enum.UserInputState.End then dg=false end end)
+        end
+    end)
+    TB.InputChanged:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseMovement then di=i end end)
+    UIS.InputChanged:Connect(function(i)
+        if i==di and dg then
+            local d=i.Position-ds
+            MF.Position=UDim2.new(sp.X.Scale,sp.X.Offset+d.X,sp.Y.Scale,sp.Y.Offset+d.Y)
+        end
+    end)
+
+    Instance.new("Frame",MF).Size=UDim2.new(1,0,0,1)
+    local al = MF:GetChildren()[#MF:GetChildren()]
+    al.Position=UDim2.new(0,0,0,30); al.BackgroundColor3=C.acc; al.BorderSizePixel=0
+
+    local TBar = Instance.new("Frame", MF)
+    TBar.Size=UDim2.new(1,0,0,26); TBar.Position=UDim2.new(0,0,0,31)
+    TBar.BackgroundColor3=Color3.fromRGB(12,12,18); TBar.BorderSizePixel=0
+    Instance.new("UIListLayout", TBar).FillDirection = Enum.FillDirection.Horizontal
+
+    local CA=Instance.new("ScrollingFrame",MF)
+    CA.Size=UDim2.new(1,-16,1,-66); CA.Position=UDim2.new(0,8,0,60)
+    CA.BackgroundTransparency=1; CA.BorderSizePixel=0
+    CA.ScrollBarThickness=4; CA.ScrollBarImageColor3=Color3.fromRGB(50,45,70)
+    CA.CanvasSize=UDim2.new(0,0,0,0); CA.AutomaticCanvasSize=Enum.AutomaticSize.Y
+    local cl=Instance.new("UIListLayout",CA)
+    cl.SortOrder=Enum.SortOrder.LayoutOrder; cl.Padding=UDim.new(0,6)
+    local cp2=Instance.new("UIPadding",CA)
+    cp2.PaddingTop=UDim.new(0,4); cp2.PaddingBottom=UDim.new(0,4)
+
+    local tabs, tabPages, activeTab = {}, {}, nil
+    local function switchTab(n)
+        if activeTab==n then return end; activeTab=n
+        for nn,b in pairs(tabs) do
+            b.BackgroundColor3=nn==n and C.tabA or C.tab
+            b.TextColor3=nn==n and C.accB or C.dim
+        end
+        for nn,p in pairs(tabPages) do p.Visible=nn==n end
+    end
+    local function makeTab(name,order)
+        local b=Instance.new("TextButton",TBar)
+        b.Text=name; b.Font=Enum.Font.GothamBold; b.TextSize=11
+        b.TextColor3=C.dim; b.BackgroundColor3=C.tab; b.BorderSizePixel=0
+        b.Size=UDim2.new(0,105,1,0); b.LayoutOrder=order; tabs[name]=b
+        local page=Instance.new("Frame",CA)
+        page.Size=UDim2.new(1,0,0,0); page.AutomaticSize=Enum.AutomaticSize.Y
+        page.BackgroundTransparency=1; page.Visible=false
+        local pl=Instance.new("UIListLayout",page); pl.SortOrder=Enum.SortOrder.LayoutOrder; pl.Padding=UDim.new(0,6)
+        tabPages[name]=page; b.MouseButton1Click:Connect(function() switchTab(name) end)
+        return page
+    end
+
+    local function sec(parent,title,order)
+        local s=Instance.new("Frame",parent)
+        s.Size=UDim2.new(1,0,0,0); s.AutomaticSize=Enum.AutomaticSize.Y
+        s.BackgroundColor3=C.hdr; s.BorderSizePixel=0; s.LayoutOrder=order
+        Instance.new("UICorner",s).CornerRadius=UDim.new(0,4)
+        local sl=Instance.new("UIListLayout",s); sl.SortOrder=Enum.SortOrder.LayoutOrder; sl.Padding=UDim.new(0,4)
+        local sp3=Instance.new("UIPadding",s)
+        sp3.PaddingLeft=UDim.new(0,8); sp3.PaddingRight=UDim.new(0,8)
+        sp3.PaddingTop=UDim.new(0,6); sp3.PaddingBottom=UDim.new(0,6)
+        if title then
+            local l=Instance.new("TextLabel",s)
+            l.Text=title; l.Font=Enum.Font.GothamBold; l.TextSize=12
+            l.TextColor3=C.accB; l.BackgroundTransparency=1
+            l.Size=UDim2.new(1,0,0,18); l.TextXAlignment=Enum.TextXAlignment.Left; l.LayoutOrder=0
+        end
+        return s
+    end
+    local function tog(parent,text,def,cb,ord)
+        local row=Instance.new("Frame",parent)
+        row.Size=UDim2.new(1,0,0,24); row.BackgroundTransparency=1; row.LayoutOrder=ord or 1
+        local lb=Instance.new("TextLabel",row)
+        lb.Text=text; lb.Font=Enum.Font.Gotham; lb.TextSize=12
+        lb.TextColor3=C.txt; lb.BackgroundTransparency=1
+        lb.Size=UDim2.new(1,-50,1,0); lb.TextXAlignment=Enum.TextXAlignment.Left
+        local bg=Instance.new("Frame",row)
+        bg.Size=UDim2.new(0,36,0,18); bg.Position=UDim2.new(1,-40,0.5,-9)
+        bg.BackgroundColor3=def and C.on or C.off; bg.BorderSizePixel=0
+        Instance.new("UICorner",bg).CornerRadius=UDim.new(1,0)
+        local kn=Instance.new("Frame",bg)
+        kn.Size=UDim2.new(0,14,0,14)
+        kn.Position=def and UDim2.new(1,-16,0.5,-7) or UDim2.new(0,2,0.5,-7)
+        kn.BackgroundColor3=Color3.new(1,1,1); kn.BorderSizePixel=0
+        Instance.new("UICorner",kn).CornerRadius=UDim.new(1,0)
+        local en=def
+        local btn=Instance.new("TextButton",row)
+        btn.Text=""; btn.BackgroundTransparency=1; btn.Size=UDim2.new(1,0,1,0)
+        btn.MouseButton1Click:Connect(function()
+            en=not en
+            TweenService:Create(bg,TweenInfo.new(0.15),{BackgroundColor3=en and C.on or C.off}):Play()
+            TweenService:Create(kn,TweenInfo.new(0.15),{Position=en and UDim2.new(1,-16,0.5,-7) or UDim2.new(0,2,0.5,-7)}):Play()
+            if cb then cb(en) end
+        end)
+    end
+    local function lbl(parent,text,ord)
+        local l=Instance.new("TextLabel",parent)
+        l.Text=text; l.Font=Enum.Font.Gotham; l.TextSize=11
+        l.TextColor3=C.dim; l.BackgroundTransparency=1
+        l.Size=UDim2.new(1,0,0,14); l.TextXAlignment=Enum.TextXAlignment.Left
+        l.TextWrapped=true; l.AutomaticSize=Enum.AutomaticSize.Y; l.LayoutOrder=ord or 99
+        return l
+    end
+    local function btn(parent,text,cb,ord)
+        local b=Instance.new("TextButton",parent)
+        b.Text=text; b.Font=Enum.Font.GothamBold; b.TextSize=12
+        b.TextColor3=C.txt; b.BackgroundColor3=C.acc; b.BorderSizePixel=0
+        b.Size=UDim2.new(1,0,0,26); b.LayoutOrder=ord or 50
+        Instance.new("UICorner",b).CornerRadius=UDim.new(0,4)
+        b.MouseButton1Click:Connect(cb)
+        b.MouseEnter:Connect(function() b.BackgroundColor3=C.accB end)
+        b.MouseLeave:Connect(function() b.BackgroundColor3=C.acc end)
+    end
+
+    -- ═══ TAB: FARM ═══
+    local farmP = makeTab("⚽ Farm", 1)
+    do
+        local s1 = sec(farmP, "🎲 Auto Farm (Roll → Pick → Restart)", 1)
+        tog(s1,"Auto Farm",false,function(v)
+            S.autoFarm=v
+            if v then doNextRoll() end
+        end,1)
+        lbl(s1,"Event-driven: Rolls → waits for result → picks best OVR → waits for team update → rolls again. Auto-restarts runs.",2)
+
+        local s2 = sec(farmP, "⚡ Manual Controls", 2)
+        btn(s2,"🎲 Roll Once",function() pcall(function() RollRequest:FireServer(); S.totalRolls=S.totalRolls+1 end) end,1)
+        btn(s2,"🔄 Reroll Year",function() pcall(function() RerollRequest:FireServer("year") end) end,2)
+        btn(s2,"🔄 Reroll 4 Cards",function() pcall(function() RerollRequest:FireServer("four") end) end,3)
+        btn(s2,"🏁 Restart Run",function() pcall(function() RestartRun:FireServer() end) end,4)
+
+        local s3 = sec(farmP, "📊 Last Roll", 3)
+        local revLbl = lbl(s3,"Waiting for roll...",1)
+        local statLbl = lbl(s3,"...",2)
+
+        task.spawn(function()
+            while true do
+                pcall(function()
+                    if S.lastReveals and S.lastReveals.reveals then
+                        local lines = {string.format("🏴 %s %d", S.lastReveals.country or "?", S.lastReveals.year or 0)}
+                        for pos, card in pairs(S.lastReveals.reveals) do
+                            local placeable = S.lastReveals.placeable and S.lastReveals.placeable[pos]
+                            lines[#lines+1] = string.format("  %s %s: %s %d OVR (%s)%s",
+                                placeable and "✅" or "❌", pos,
+                                card.name or "?", card.ovr or 0,
+                                getTierName(card.ovr or 0),
+                                card.shiny and " ✨" or "")
+                        end
+                        revLbl.Text = table.concat(lines, "\n")
+                    end
+
+                    local coins = 0
+                    pcall(function() coins = RequestCoins:InvokeServer() end)
+                    local teamOvr = S.lastTeam and S.lastTeam.overall or "?"
+                    local filled = 0
+                    if S.lastTeam and S.lastTeam.filled then
+                        for _, v in pairs(S.lastTeam.filled) do filled = filled + (v or 0) end
+                    end
+                    statLbl.Text = string.format(
+                        "💰 %s coins | 🎲 %d rolls | ✅ %d picks | ⭐ Best: %d\n🏆 Team OVR: %s | Complete: %s",
+                        tostring(coins), S.totalRolls, S.totalPicks, S.bestPull,
+                        tostring(teamOvr), S.runComplete and "YES" or "NO")
+                end)
+                task.wait(1)
+            end
+        end)
+    end
+
+    -- ═══ TAB: SQUAD ═══
+    local squadP = makeTab("🏆 Squad", 2)
+    do
+        local s1 = sec(squadP, "🏆 Best Team", 1)
+        local sqLbl = lbl(s1,"Click Refresh",1)
+        btn(s1,"🔄 Refresh",function()
+            pcall(function()
+                local t = RequestBestTeam:InvokeServer()
+                if t and t.slots then
+                    local lines = {"Overall: " .. (t.overall or "?")}
+                    for i, slot in ipairs(t.slots) do
+                        local p = slot.player
+                        if p then
+                            lines[#lines+1] = string.format("%d. [%s] %s %d | %s %d%s",
+                                i, slot.pos, p.name, p.ovr, p.country, p.year,
+                                p.shiny and " ✨" or "")
+                        end
+                    end
+                    sqLbl.Text = table.concat(lines, "\n")
+                end
+            end)
+        end,2)
+
+        local s2 = sec(squadP, "📦 Collection", 2)
+        local coLbl = lbl(s2,"Click Refresh",1)
+        btn(s2,"🔄 Refresh",function()
+            pcall(function()
+                local c = RequestCollection:InvokeServer()
+                if type(c)=="table" then
+                    local tot,sh = 0,0
+                    for k in pairs(c) do tot=tot+1; if k:find(":shiny") then sh=sh+1 end end
+                    coLbl.Text = string.format("Cards: %d | Shiny: %d (%.1f%%)", tot, sh, tot>0 and sh/tot*100 or 0)
+                end
+            end)
+        end,2)
+    end
+
+    -- ═══ TAB: FEED ═══
+    local feedP = makeTab("📢 Feed", 3)
+    do
+        local s1 = sec(feedP, "📢 Server Rare Pulls", 1)
+        local fLbl = lbl(s1,"Listening...",1)
+        task.spawn(function()
+            while true do
+                pcall(function()
+                    if #S.rareLog > 0 then
+                        local shown = {}
+                        for i = 1, math.min(20, #S.rareLog) do shown[#shown+1] = S.rareLog[i] end
+                        fLbl.Text = table.concat(shown, "\n")
+                    end
+                end)
+                task.wait(1)
+            end
+        end)
+    end
+
+    -- ═══ TAB: UTILS ═══
+    local utilP = makeTab("🔧 Utils", 4)
+    do
+        local s0 = sec(utilP, "🛡️ Anti-AFK", 1)
+        tog(s0,"Anti-AFK (never get kicked)",true,function(v) S.antiAFK=v end,1)
+        lbl(s0,"Hooks Player.Idled + 60s backup click. Leave it ON to AFK farm.",2)
+
+        local s1 = sec(utilP, "🏃 Movement", 2)
+        tog(s1,"Speed (3x)",false,function(v) S.speedHack=v; if Humanoid then Humanoid.WalkSpeed=v and 50 or 16 end end,1)
+        tog(s1,"Noclip",false,function(v)
+            S.noclip=v
+            if v then RunService:BindToRenderStep("HS",1,function()
+                if Char then for _,p in pairs(Char:GetDescendants()) do if p:IsA("BasePart") then p.CanCollide=false end end end
+            end) else pcall(function() RunService:UnbindFromRenderStep("HS") end) end
+        end,2)
+
+        local s2 = sec(utilP, "💡 Tiers", 3)
+        lbl(s2,"105+ Ballon 🏆 | 99+ Icon 💎 | 95+ Neon 💚",1)
+        lbl(s2,"90+ Platinum 🩵 | 85+ Gold ⭐ | 80+ Silver ⚪",2)
+        lbl(s2,"Shiny: 4% chance (+5 OVR) | Special: 1%",3)
+    end
+
+    switchTab("⚽ Farm")
+
+    UIS.InputBegan:Connect(function(i,g)
+        if g then return end
+        if i.KeyCode==Enum.KeyCode.RightControl then S.visible=not S.visible; MF.Visible=S.visible end
+    end)
+end
+
+buildGui()
+print("[Hatsu Soccer v2] Loaded! Event-driven auto farm. RCtrl to toggle.")
